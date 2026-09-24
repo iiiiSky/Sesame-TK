@@ -10,6 +10,7 @@ import tkaxv7s.xposed.sesame.data.task.ModelTask;
 import tkaxv7s.xposed.sesame.entity.AlipayUser;
 import tkaxv7s.xposed.sesame.model.base.TaskCommon;
 import tkaxv7s.xposed.sesame.model.normal.answerAI.AnswerAI;
+import tkaxv7s.xposed.sesame.rpc.intervallimit.RpcIntervalLimit;
 import tkaxv7s.xposed.sesame.util.*;
 
 import java.util.*;
@@ -103,6 +104,9 @@ public class AntFarm extends ModelTask {
     private ChoiceModelField hireAnimalType;
     private SelectModelField hireAnimalList;
     private BooleanModelField enableDdrawGameCenterAward;
+    private BooleanModelField getFeed;
+    private SelectModelField getFeedlList;
+    private ChoiceModelField getFeedType;
 
     @Override
     public ModelFields getFields() {
@@ -113,6 +117,9 @@ public class AntFarm extends ModelTask {
         modelFields.addField(rewardFriend = new BooleanModelField("rewardFriend", "打赏好友", false));
         modelFields.addField(feedAnimal = new BooleanModelField("feedAnimal", "自动喂小鸡", false));
         modelFields.addField(feedFriendAnimalList = new SelectAndCountModelField("feedFriendAnimalList", "喂小鸡好友列表", new LinkedHashMap<>(), AlipayUser::getList));
+        modelFields.addField(getFeed = new BooleanModelField("getFeed", "一起拿饲料", false));
+        modelFields.addField(getFeedType = new ChoiceModelField("getFeedType", "一起拿饲料 | 动作", GetFeedType.GIVE, GetFeedType.nickNames));
+        modelFields.addField(getFeedlList = new SelectModelField("getFeedlList", "一起拿饲料 | 好友列表", new LinkedHashSet<>(), AlipayUser::getList));
         modelFields.addField(acceptGift = new BooleanModelField("acceptGift", "收麦子", false));
         modelFields.addField(visitFriendList = new SelectAndCountModelField("visitFriendList", "送麦子好友列表", new LinkedHashMap<>(), AlipayUser::getList));
         modelFields.addField(hireAnimal = new BooleanModelField("hireAnimal", "雇佣小鸡 | 开启", false));
@@ -147,6 +154,12 @@ public class AntFarm extends ModelTask {
     }
 
     @Override
+    public void boot(ClassLoader classLoader) {
+        super.boot(classLoader);
+        RpcIntervalLimit.addIntervalLimit("com.alipay.antfarm.enterFarm", 2000);
+    }
+
+    @Override
     public Boolean check() {
         return !TaskCommon.IS_ENERGY_TIME;
     }
@@ -154,7 +167,7 @@ public class AntFarm extends ModelTask {
     @Override
     public void run() {
         try {
-            if (!enterFarm()) {
+            if (enterFarm() == null) {
                 return;
             }
 
@@ -271,7 +284,7 @@ public class AntFarm extends ModelTask {
                 handleDonation(donationCount.getValue());
             }
 
-            if (answerQuestion.getValue() && Status.canAnswerQuestionToday(UserIdMap.getCurrentUid())) {
+            if (answerQuestion.getValue() && Status.canAnswerQuestionToday()) {
                 answerQuestion();
             }
 
@@ -288,9 +301,6 @@ public class AntFarm extends ModelTask {
                         needReload = true;
                     }
                 }
-                while (useAccelerateToolBeforeCheck()) {
-                    enterFarm();
-                }
                 // if (AnimalBuff.ACCELERATING.name().equals(ownerAnimal.animalBuff)) {
                 //     Log.record("小鸡在加速吃饭");
                 // } else if (useAccelerateTool.getValue() && !AnimalFeedStatus.HUNGRY.name().equals(ownerAnimal.animalFeedStatus)) {
@@ -299,6 +309,11 @@ public class AntFarm extends ModelTask {
                 //         needReload = true;
                 //     }
                 // }
+                if (useAccelerateTool.getValue() && !AnimalFeedStatus.HUNGRY.name().equals(ownerAnimal.animalFeedStatus)) {
+                    if (useAccelerateTool()) {
+                        needReload = true;
+                    }
+                }
 
                 if (needReload) {
                     enterFarm();
@@ -309,27 +324,7 @@ public class AntFarm extends ModelTask {
                     listOrnaments();
                 }
 
-                if (feedAnimal.getValue()) {
-                    try {
-                        Long startEatTime = ownerAnimal.startEatTime;
-                        double allFoodHaveEatten = 0d;
-                        double allConsumeSpeed = 0d;
-                        for (Animal animal : animals) {
-                            allFoodHaveEatten += animal.foodHaveEatten;
-                            allConsumeSpeed += animal.consumeSpeed;
-                        }
-                        long nextFeedTime = startEatTime + (long) ((180 - (allFoodHaveEatten)) / (allConsumeSpeed)) * 1000;
-                        String taskId = "FA|" + ownerFarmId;
-                        if (!hasChildTask(taskId)) {
-                            addChildTask(new ChildModelTask(taskId, "FA", () -> feedAnimal(ownerFarmId), nextFeedTime));
-                            Log.record("添加蹲点投喂🥣[" + UserIdMap.getCurrentMaskName() + "]在[" + TimeUtil.getCommonDate(nextFeedTime) + "]执行");
-                        } else {
-                            addChildTask(new ChildModelTask(taskId, "FA", () -> feedAnimal(ownerFarmId), nextFeedTime));
-                        }
-                    } catch (Exception e) {
-                        Log.printStackTrace(e);
-                    }
-                }
+                autoFeedAnimal();
 
                 if (unreceiveTaskAward > 0) {
                     Log.record("还有待领取的饲料");
@@ -360,6 +355,10 @@ public class AntFarm extends ModelTask {
             // 雇佣小鸡
             if (hireAnimal.getValue()) {
                 hireAnimal();
+            }
+
+            if (getFeed.getValue()) {
+                letsGetChickenFeedTogether();
             }
 
             // 开宝箱
@@ -423,7 +422,7 @@ public class AntFarm extends ModelTask {
         animalWakeUpTime(animalWakeUpTime);
     }
 
-    private Boolean enterFarm() {
+    private JSONObject enterFarm() {
         try {
             String s = AntFarmRpcCall.enterFarm("", UserIdMap.getCurrentUid());
             if (s == null) {
@@ -452,14 +451,38 @@ public class AntFarm extends ModelTask {
                         && foodStockLimit - foodStock >= 10) {
                     acceptGift();
                 }
-                return true;
+                return jo;
             } else {
                 Log.record(s);
             }
         } catch (Exception e) {
             Log.printStackTrace(e);
         }
-        return false;
+        return null;
+    }
+
+    private void autoFeedAnimal() {
+        if (feedAnimal.getValue()) {
+            try {
+                Long startEatTime = ownerAnimal.startEatTime;
+                double allFoodHaveEatten = 0d;
+                double allConsumeSpeed = 0d;
+                for (Animal animal : animals) {
+                    allFoodHaveEatten += animal.foodHaveEatten;
+                    allConsumeSpeed += animal.consumeSpeed;
+                }
+                long nextFeedTime = startEatTime + (long) ((180 - (allFoodHaveEatten)) / (allConsumeSpeed)) * 1000;
+                String taskId = "FA|" + ownerFarmId;
+                if (!hasChildTask(taskId)) {
+                    addChildTask(new ChildModelTask(taskId, "FA", () -> feedAnimal(ownerFarmId), nextFeedTime));
+                    Log.record("添加蹲点投喂🥣[" + UserIdMap.getCurrentMaskName() + "]在[" + TimeUtil.getCommonDate(nextFeedTime) + "]执行");
+                } else {
+                    addChildTask(new ChildModelTask(taskId, "FA", () -> feedAnimal(ownerFarmId), nextFeedTime));
+                }
+            } catch (Exception e) {
+                Log.printStackTrace(e);
+            }
+        }
     }
 
     private void animalSleepTime(long animalSleepTime) {
@@ -850,7 +873,7 @@ public class AntFarm extends ModelTask {
                                         }
                                         Log.record("答题" + (correct ? "正确" : "错误") + "可领取［"
                                                 + extInfo.getString("award") + "克］");
-                                        Status.answerQuestionToday(UserIdMap.getCurrentUid());
+                                        Status.answerQuestionToday();
 
                                         JSONArray operationConfigList = joDailySubmit
                                                 .getJSONArray("operationConfigList");
@@ -880,12 +903,12 @@ public class AntFarm extends ModelTask {
 
                             case RECEIVED:
                                 Log.record("今日答题已完成");
-                                Status.answerQuestionToday(UserIdMap.getCurrentUid());
+                                Status.answerQuestionToday();
                                 break;
 
                             case FINISHED:
                                 Log.record("已经答过题了，饲料待领取");
-                                Status.answerQuestionToday(UserIdMap.getCurrentUid());
+                                Status.answerQuestionToday();
                                 break;
                         }
                         break;
@@ -1141,37 +1164,32 @@ public class AntFarm extends ModelTask {
         }
     }
 
-    private Boolean useAccelerateToolBeforeCheck() {
-        try {
-            String s = AntFarmRpcCall.syncAnimalStatus(ownerFarmId);
-            JSONObject jo = new JSONObject(s);
-            String memo = jo.getString("memo");
-            if ("SUCCESS".equals(jo.getString("memo"))) {
-                int feedTimes = 0;
-                JSONArray ja = jo.getJSONObject("subFarmVO").getJSONArray("animals");
-                for (int i = 0; i < ja.length(); i++) {
-                    jo = ja.getJSONObject(i);
-                    feedTimes += jo.getInt("feedTimes");
-                }
-                if (feedTimes > 60 * 60 * 4) {
-                    return false;
-                }
-                if (!Status.canUseAccelerateTool()) {
-                    return false;
-                }
-                if (useFarmTool(ownerFarmId, ToolType.ACCELERATETOOL)) {
-                    Status.useAccelerateTool();
-                    return true;
-                }
-            } else {
-                Log.record(memo);
-                Log.i(s);
-            }
-        } catch (Throwable t) {
-            Log.i(TAG, "useAccelerateToolBeforeCheck err:");
-            Log.printStackTrace(TAG, t);
+    private boolean useAccelerateTool() {
+        if (!Status.canUseAccelerateTool()) {
+            return false;
         }
-        return false;
+        syncAnimalStatus(ownerFarmId);
+        double consumeSpeed = 0d;
+        double allFoodHaveEatten = 0d;
+        long nowTime = System.currentTimeMillis() / 1000;
+        for (Animal animal : animals) {
+            if (animal.masterFarmId.equals(ownerFarmId)) {
+                consumeSpeed = animal.consumeSpeed;
+            }
+            allFoodHaveEatten += animal.foodHaveEatten;
+            allFoodHaveEatten += animal.consumeSpeed * (nowTime - animal.startEatTime / 1000);
+        }
+        // consumeSpeed: g/s
+        // AccelerateTool: -1h = -60m = -3600s
+        boolean isUseAccelerateTool = false;
+        while (180 - allFoodHaveEatten >= consumeSpeed * 3600
+                && useFarmTool(ownerFarmId, ToolType.ACCELERATETOOL)) {
+            allFoodHaveEatten += consumeSpeed * 3600;
+            isUseAccelerateTool = true;
+            Status.useAccelerateTool();
+            TimeUtil.sleep(1000);
+        }
+        return isUseAccelerateTool;
     }
 
     private Boolean useFarmTool(String targetFarmId, ToolType toolType) {
@@ -1828,7 +1846,7 @@ public class AntFarm extends ModelTask {
                             if (chouchouleReceiveFarmTaskAward(taskId)) {
                                 doubleCheck = true;
                             }
-                        } else if ("TODO".equals(taskStatus)) {
+                        } else if ("TODO".equals(taskStatus) && !Objects.equals(jo.optString("innerAction"), "DONATION")) {
                             if (chouchouleDoFarmTask(taskId, title, rightsTimesLimit - rightsTimes)) {
                                 doubleCheck = true;
                             }
@@ -1903,15 +1921,16 @@ public class AntFarm extends ModelTask {
     private void hireAnimal() {
         JSONArray animals = null;
         try {
-            String s = AntFarmRpcCall.enterFarm("", UserIdMap.getCurrentUid());
-            JSONObject jsonObject = new JSONObject(s);
+            JSONObject jsonObject = enterFarm();
+            if (jsonObject == null) {
+                return;
+            }
             if ("SUCCESS".equals(jsonObject.getString("memo"))) {
                 JSONObject farmVO = jsonObject.getJSONObject("farmVO");
                 JSONObject subFarmVO = farmVO.getJSONObject("subFarmVO");
                 animals = subFarmVO.getJSONArray("animals");
             } else {
                 Log.record(jsonObject.getString("memo"));
-                Log.i(s);
             }
         } catch (Throwable t) {
             Log.i(TAG, "getAnimalCount err:");
@@ -1948,6 +1967,10 @@ public class AntFarm extends ModelTask {
                 return;
             }
             Log.farm("雇佣小鸡👷[当前可雇佣小鸡数量:" + (3 - animalCount) + "只]");
+            if (foodStock < 50) {
+                Log.record("饲料不足，暂不雇佣");
+                return;
+            }
             Set<String> hireAnimalSet = hireAnimalList.getValue();
             boolean hasNext;
             int pageStartSum = 0;
@@ -1987,6 +2010,8 @@ public class AntFarm extends ModelTask {
             } while (hasNext && animalCount < 3);
             if (animalCount < 3) {
                 Log.farm("雇佣小鸡失败，没有足够的小鸡可以雇佣");
+            } else {
+                autoFeedAnimal();
             }
         } catch (Throwable t) {
             Log.i(TAG, "hireAnimal err:");
@@ -2159,6 +2184,90 @@ public class AntFarm extends ModelTask {
             Log.printStackTrace(TAG, t);
         }
     }
+    // 一起拿小鸡饲料
+    private void letsGetChickenFeedTogether() {
+        try {
+            JSONObject jo = new JSONObject(AntFarmRpcCall.letsGetChickenFeedTogether());
+            if (jo.getBoolean("success")) {
+                String bizTraceId = jo.getString("bizTraceId");
+                JSONArray p2pCanInvitePersonDetailList = jo.getJSONArray("p2pCanInvitePersonDetailList");
+
+                // 统计可邀请和已邀请的数量
+                int canInviteCount = 0;
+                int hasInvitedCount = 0;
+
+                List<String> userIdList = new ArrayList<>(); // 保存 userId
+                for (int i = 0; i < p2pCanInvitePersonDetailList.length(); i++) {
+                    JSONObject personDetail = p2pCanInvitePersonDetailList.getJSONObject(i);
+                    String inviteStatus = personDetail.getString("inviteStatus");
+                    String userId = personDetail.getString("userId");
+
+                    userIdList.add(userId); // 将 userId 存起来
+
+                    // 统计可邀请和已邀请的数量
+                    if (inviteStatus.equals("CAN_INVITE")) {
+                        canInviteCount++;
+                    } else if (inviteStatus.equals("HAS_INVITED")) {
+                        hasInvitedCount++;
+                    }
+                }
+
+                // 判断今天已经邀请了多少人
+                int invitedToday = hasInvitedCount;
+
+                // 可以邀请的人数不超过五个
+                int remainingInvites = 5 - invitedToday;
+                int invitesToSend = Math.min(canInviteCount, remainingInvites);
+
+                if (invitesToSend==0)
+                    return;
+                Set<String> getFeedSet = getFeedlList.getValue();
+
+                // 判断 getFeedType 的值来确定是根据勾选列表还是随机选择发送邀请
+                if (getFeedType.getValue() == GetFeedType.GIVE) {
+                    // 根据勾选列表进行邀请操作
+                    for (int j = 0; j < invitesToSend; j++) {
+                        String userId = userIdList.get(j);
+                        // 判断 userId 是否存在于 getFeedSet 中
+                        if (getFeedSet.contains(userId)) {
+                            // 调用邀请方法
+                            jo = new JSONObject(AntFarmRpcCall.giftOfFeed(bizTraceId, userId));
+                            if (jo.getBoolean("success")) {
+                                Log.record("一起拿小鸡饲料🥡 [送饲料：" + UserIdMap.getMaskName(userId) + "]");
+                            } else {
+                                Log.record("邀请失败：" + jo);
+                                break; // 如果邀请失败，根据需求处理中断操作
+                            }
+                        } else {
+//                             Log.record("用户 " + userId + " 不在勾选的好友列表中，不发送邀请。");
+                        }
+                    }
+                } else {
+                    // 随机选择发送邀请操作
+                    Random random = new Random();
+                    for (int j = 0; j < invitesToSend; j++) {
+                        int randomIndex = random.nextInt(userIdList.size());
+                        String userId = userIdList.get(randomIndex);
+                        // 调用邀请方法
+                        jo = new JSONObject(AntFarmRpcCall.giftOfFeed(bizTraceId, userId));
+                        if (jo.getBoolean("success")) {
+                            Log.record("一起拿小鸡饲料🥡 [送饲料：" + UserIdMap.getMaskName(userId) + "]");
+                        } else {
+                            Log.record("邀请失败：" + jo);
+                            break; // 如果邀请失败，根据需求处理中断操作
+                        }
+                        // 从列表中移除已经尝试过的用户ID，确保不重复邀请同一个人
+                        userIdList.remove(randomIndex);
+                    }
+                }
+
+
+            }
+        } catch (JSONException e) {
+            Log.i(TAG, "letsGetChickenFeedTogether err:");
+            Log.printStackTrace(e);
+        }
+    }
 
     public interface DonationCount {
 
@@ -2176,7 +2285,7 @@ public class AntFarm extends ModelTask {
         int WHEN_HUNGRY = 2;
         int NEVER = 3;
 
-        String[] nickNames = {"始终召回", "偷吃时召回", "饥饿时召回", "不召回"};
+        String[] nickNames = {"始终召回", "偷吃召回", "饥饿召回", "暂不召回"};
     }
 
     public interface SendBackAnimalWay {
@@ -2268,6 +2377,14 @@ public class AntFarm extends ModelTask {
         int DONT_HIRE = 1;
 
         String[] nickNames = {"选中雇佣", "选中不雇佣"};
+
+    }
+    public interface GetFeedType {
+
+        int GIVE = 0;
+        int RANDOM = 1;
+
+        String[] nickNames = {"选中赠送", "随机送"};
 
     }
 
